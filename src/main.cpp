@@ -147,18 +147,44 @@ std::vector<std::pair<std::vector<int>, int>> generate_dataset() {
     for(int key=10; key<20; ++key) {
         for(int trial=0; trial<50; ++trial) {
             std::vector<int> seq;
-            seq.push_back(1); seq.push_back(key);
+            seq.push_back(1); seq.push_back(key & 0xFF);
             for(int i=0; i<CONTEXT_LEN-2; ++i) seq.push_back(rand() % 5);
-            data.push_back({seq, key});
+            data.push_back({seq, key & 0xFF});
         }
     }
+    return data;
+}
+
+std::vector<std::pair<std::vector<int>, int>> load_real_dataset(const std::string& filepath) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cout << "[Aviso] Nao foi possivel abrir o arquivo do dataset: " << filepath << ". Usando dataset sintetico padrao.\n";
+        return generate_dataset();
+    }
+    
+    std::vector<int> tokens;
+    char byte;
+    while (file.get(byte)) {
+        tokens.push_back(static_cast<unsigned char>(byte));
+    }
+    file.close();
+    
+    std::vector<std::pair<std::vector<int>, int>> data;
+    // Criar sequencias de tamanho CONTEXT_LEN
+    for (size_t i = 0; i + CONTEXT_LEN < tokens.size(); i += CONTEXT_LEN / 2) {
+        std::vector<int> seq(tokens.begin() + i, tokens.begin() + i + CONTEXT_LEN - 1);
+        int target = tokens[i + CONTEXT_LEN - 1];
+        data.push_back({seq, target});
+        if (data.size() >= 1000) break; // Limite de 1000 exemplos para treino rapido
+    }
+    std::cout << "Dataset real carregado com " << data.size() << " sequencias a partir de: " << filepath << "\n";
     return data;
 }
 
 int main() {
     std::cout << "=== Sparse Paged LLM Experiment ===\n";
     PaginatedModel model;
-    auto dataset = generate_dataset();
+    auto dataset = load_real_dataset("C:/Users/fahre/Desktop/Qwythos_Project/calibration_mythos_256.txt");
     std::vector<double> loss_history;
     int epochs = 20;
     std::random_device rd;

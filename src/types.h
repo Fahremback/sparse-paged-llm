@@ -10,7 +10,7 @@
 #include <iomanip>
 
 // Configurações Globais da Arquitetura
-constexpr int VOCAB_SIZE = 64;      // Alfabeto pequeno para prova de conceito
+constexpr int VOCAB_SIZE = 256;      // Alfabeto completo (byte-level) para dataset de texto
 constexpr int HIDDEN_DIM = 128;     // Dimensão interna do modelo
 constexpr int NUM_EXPERTS = 8;      // Total de experts no banco esparso
 constexpr int TOP_K = 2;            // Experts ativos por token (Sparsity)
