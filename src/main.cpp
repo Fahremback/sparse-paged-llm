@@ -161,10 +161,12 @@ int main() {
     auto dataset = generate_dataset();
     std::vector<double> loss_history;
     int epochs = 20;
+    std::random_device rd;
+    std::mt19937 g(rd());
 
     for (int ep = 0; ep < epochs; ++ep) {
         double epoch_loss = 0.0;
-        std::random_shuffle(dataset.begin(), dataset.end());
+        std::shuffle(dataset.begin(), dataset.end(), g);
         for (size_t i = 0; i < dataset.size(); ++i) {
             epoch_loss += model.forward_step(dataset[i].first, dataset[i].second, true);
         }

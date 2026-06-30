@@ -26,15 +26,17 @@ struct Tensor {
     bool requires_grad = false;
 
     Tensor() {}
-    Tensor(std::vector<int> s, bool grad = false) : shape(s), requires_grad(grad) {
+    Tensor(std::vector<int> s, bool req_grad = false) : shape(s), requires_grad(req_grad) {
         int size = 1;
         for (int d : s) size *= d;
         data.resize(size, 0.0f);
-        if (grad) grad.resize(size, 0.0f);
+        if (req_grad) grad.resize(size, 0.0f);
     }
 
     float& at(int i) { return data[i]; }
     float at(int i) const { return data[i]; }
+    float& at(int i, int j) { return data[index(i, j)]; }
+    float at(int i, int j) const { return data[index(i, j)]; }
     int size() const { return data.size(); }
     
     void zero_grad() {
