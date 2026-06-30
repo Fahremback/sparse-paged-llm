@@ -109,7 +109,7 @@ public:
         return emb;
     }
 
-    float forward_step(const std::vector<int>& context, int target_token, bool train=true) {
+    float forward_step(const std::vector<int>& context, int target_token, bool train=true, float weight_decay = 0.0005f) {
         int current_block = (context.size() / BLOCK_SIZE) % NUM_BLOCKS;
         auto access = pager.access_block(current_block);
         
@@ -132,20 +132,25 @@ public:
             for(int i=0; i<HIDDEN_DIM; ++i) {
                 for(int v=0; v<VOCAB_SIZE; ++v) {
                     grad_h[i] += grad_logits[v] * head_weights.at(i, v);
-                    head_weights.data[head_weights.index(i,v)] -= 0.01f * grad_logits[v] * h[i];
+                    float& w_val = head_weights.data[head_weights.index(i,v)];
+                    w_val -= 0.01f * (grad_logits[v] * h[i] + weight_decay * w_val);
                 }
-                embed_table.data[embed_table.index(context.back(), i)] -= 0.01f * grad_h[i];
+                float& emb_val = embed_table.data[embed_table.index(context.back(), i)];
+                emb_val -= 0.01f * (grad_h[i] + weight_decay * emb_val);
             }
             moe.backward(h, grad_h, active_experts, 0.01f);
         }
         return loss;
     }
 
-    std::string generate(const std::string& prompt, int max_new_tokens) {
+    std::string generate(const std::string& prompt, int max_new_tokens, float temperature = 0.8f, int top_k = 10) {
         std::vector<int> context;
         for (char c : prompt) {
             context.push_back(static_cast<unsigned char>(c));
         }
+        
+        std::random_device rd_sample;
+        std::mt19937 gen_sample(rd_sample());
         
         std::string generated = prompt;
         for (int step = 0; step < max_new_tokens; ++step) {
@@ -168,14 +173,38 @@ public:
                 logits[v] = sum;
             }
             
-            int next_token = 0;
-            float max_logit = -1e9f;
+            // Apply Temperature
+            std::vector<float> probs(VOCAB_SIZE, 0.0f);
+            float max_l = *std::max_element(logits.begin(), logits.end());
+            float sum_e = 0.0f;
             for (int v = 0; v < VOCAB_SIZE; ++v) {
-                if (logits[v] > max_logit) {
-                    max_logit = logits[v];
-                    next_token = v;
-                }
+                probs[v] = std::exp((logits[v] - max_l) / (temperature + 1e-6f));
+                sum_e += probs[v];
             }
+            for (int v = 0; v < VOCAB_SIZE; ++v) {
+                probs[v] /= sum_e;
+            }
+            
+            // Top-K Filtering
+            std::vector<std::pair<float, int>> candidates;
+            for (int v = 0; v < VOCAB_SIZE; ++v) {
+                candidates.push_back({probs[v], v});
+            }
+            std::sort(candidates.begin(), candidates.end(), std::greater<>());
+            
+            int actual_k = std::min(top_k, VOCAB_SIZE);
+            float top_k_sum = 0.0f;
+            for (int k = 0; k < actual_k; ++k) {
+                top_k_sum += candidates[k].first;
+            }
+            
+            std::vector<float> top_k_probs(actual_k);
+            for (int k = 0; k < actual_k; ++k) {
+                top_k_probs[k] = candidates[k].first / (top_k_sum + 1e-9f);
+            }
+            
+            std::discrete_distribution<> dist(top_k_probs.begin(), top_k_probs.end());
+            int next_token = candidates[dist(gen_sample)].second;
             
             context.push_back(next_token);
             generated += static_cast<char>(next_token);
@@ -229,10 +258,10 @@ int main() {
     int steps_per_epoch = 1000;
     int val_steps = 150;
 
-    std::cout << "Realizando teste de geracao inicial (antes do treino):\n";
+    std::cout << "Realizando teste de geracao inicial (antes do treino, temp=0.7, top_k=15):\n";
     std::string test_prompt = "<|im_start|>user\nOnce upon a time, there was a little";
     std::cout << "------------------------------------\n";
-    std::cout << model.generate(test_prompt, 100) << "\n";
+    std::cout << model.generate(test_prompt, 100, 0.7f, 15) << "\n";
     std::cout << "------------------------------------\n\n";
 
     // 2. Loop de Treinamento e Validacao
@@ -261,7 +290,9 @@ int main() {
         if (ep % 5 == 0 || ep == epochs - 1) {
             std::cout << "Epoch " << ep 
                       << ": Train Loss = " << std::fixed << std::setprecision(4) << train_loss 
-                      << " | Val Loss = " << val_loss << "\n";
+                      << " (PPL = " << std::exp(train_loss) << ")"
+                      << " | Val Loss = " << val_loss 
+                      << " (PPL = " << std::exp(val_loss) << ")\n";
         }
     }
 
@@ -272,14 +303,15 @@ int main() {
     std::cout << "Val Loss Reduction: " << val_reduction << "%\n";
     
     if (val_loss_history.back() < val_loss_history.front()) {
-        std::cout << "SUCCESS: Model is learning and generalizing (Validation Loss reduced by " << val_reduction << "%).\n";
+        std::cout << "SUCCESS: Model is learning and generalizing (Val PPL reduced from " 
+                  << std::exp(val_loss_history.front()) << " to " << std::exp(val_loss_history.back()) << ").\n";
     } else {
         std::cout << "WARNING: Model may be overfitting or not learning.\n";
     }
     
-    std::cout << "\nRealizando teste de geracao final (apos o treino):\n";
+    std::cout << "\nRealizando teste de geracao final (apos o treino, temp=0.7, top_k=15):\n";
     std::cout << "------------------------------------\n";
-    std::cout << model.generate(test_prompt, 100) << "\n";
+    std::cout << model.generate(test_prompt, 100, 0.7f, 15) << "\n";
     std::cout << "------------------------------------\n";
     
     model.pager.print_stats();
