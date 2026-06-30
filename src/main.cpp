@@ -140,6 +140,48 @@ public:
         }
         return loss;
     }
+
+    std::string generate(const std::string& prompt, int max_new_tokens) {
+        std::vector<int> context;
+        for (char c : prompt) {
+            context.push_back(static_cast<unsigned char>(c));
+        }
+        
+        std::string generated = prompt;
+        for (int step = 0; step < max_new_tokens; ++step) {
+            std::vector<int> window = context;
+            if (window.size() >= CONTEXT_LEN) {
+                window.erase(window.begin(), window.begin() + (window.size() - CONTEXT_LEN + 1));
+            }
+            
+            int current_block = (window.size() / BLOCK_SIZE) % NUM_BLOCKS;
+            pager.access_block(current_block);
+            
+            std::vector<float> h = get_embedding(window.back());
+            std::vector<int> active_experts;
+            h = moe.forward(h, active_experts);
+            
+            std::vector<float> logits(VOCAB_SIZE, 0.0f);
+            for(int v=0; v<VOCAB_SIZE; ++v) {
+                float sum = 0;
+                for(int i=0; i<HIDDEN_DIM; ++i) sum += h[i] * head_weights.at(i, v);
+                logits[v] = sum;
+            }
+            
+            int next_token = 0;
+            float max_logit = -1e9f;
+            for (int v = 0; v < VOCAB_SIZE; ++v) {
+                if (logits[v] > max_logit) {
+                    max_logit = logits[v];
+                    next_token = v;
+                }
+            }
+            
+            context.push_back(next_token);
+            generated += static_cast<char>(next_token);
+        }
+        return generated;
+    }
 };
 
 std::vector<std::pair<std::vector<int>, int>> generate_dataset() {
@@ -184,28 +226,71 @@ std::vector<std::pair<std::vector<int>, int>> load_real_dataset(const std::strin
 int main() {
     std::cout << "=== Sparse Paged LLM Experiment ===\n";
     PaginatedModel model;
+    
+    // 1. Carregar dataset e dividir em Treino (85%) e Validacao (15%)
     auto dataset = load_real_dataset("C:/Users/fahre/Desktop/Qwythos_Project/calibration_mythos_256.txt");
-    std::vector<double> loss_history;
-    int epochs = 20;
+    
     std::random_device rd;
     std::mt19937 g(rd());
+    std::shuffle(dataset.begin(), dataset.end(), g);
+    
+    size_t train_size = static_cast<size_t>(dataset.size() * 0.85);
+    std::vector<std::pair<std::vector<int>, int>> train_dataset(dataset.begin(), dataset.begin() + train_size);
+    std::vector<std::pair<std::vector<int>, int>> val_dataset(dataset.begin() + train_size, dataset.end());
+    
+    std::cout << "Divisao dos Dados: " << train_dataset.size() << " treinos, " << val_dataset.size() << " validacoes.\n\n";
+    
+    std::vector<double> train_loss_history;
+    std::vector<double> val_loss_history;
+    int epochs = 20;
 
+    std::cout << "Realizando teste de geracao inicial (antes do treino):\n";
+    std::string test_prompt = "<|im_start|>user\nSolve";
+    std::cout << "------------------------------------\n";
+    std::cout << model.generate(test_prompt, 80) << "\n";
+    std::cout << "------------------------------------\n\n";
+
+    // 2. Loop de Treinamento e Validacao
     for (int ep = 0; ep < epochs; ++ep) {
-        double epoch_loss = 0.0;
-        std::shuffle(dataset.begin(), dataset.end(), g);
-        for (size_t i = 0; i < dataset.size(); ++i) {
-            epoch_loss += model.forward_step(dataset[i].first, dataset[i].second, true);
+        double train_loss = 0.0;
+        std::shuffle(train_dataset.begin(), train_dataset.end(), g);
+        for (size_t i = 0; i < train_dataset.size(); ++i) {
+            train_loss += model.forward_step(train_dataset[i].first, train_dataset[i].second, true);
         }
-        epoch_loss /= dataset.size();
-        loss_history.push_back(epoch_loss);
-        if (ep % 5 == 0 || ep == epochs-1)
-            std::cout << "Epoch " << ep << ": Loss = " << std::fixed << std::setprecision(4) << epoch_loss << "\n";
+        train_loss /= train_dataset.size();
+        train_loss_history.push_back(train_loss);
+        
+        // Avaliacao na Validacao (sem atualizar pesos)
+        double val_loss = 0.0;
+        for (size_t i = 0; i < val_dataset.size(); ++i) {
+            val_loss += model.forward_step(val_dataset[i].first, val_dataset[i].second, false);
+        }
+        val_loss /= val_dataset.size();
+        val_loss_history.push_back(val_loss);
+
+        if (ep % 5 == 0 || ep == epochs - 1) {
+            std::cout << "Epoch " << ep 
+                      << ": Train Loss = " << std::fixed << std::setprecision(4) << train_loss 
+                      << " | Val Loss = " << val_loss << "\n";
+        }
     }
 
-    double reduction = (loss_history.front() - loss_history.back()) / loss_history.front() * 100.0;
-    std::cout << "\nLoss Reduction: " << reduction << "%\n";
-    if (loss_history.back() < loss_history.front() * 0.5) 
-        std::cout << "SUCCESS: Architecture learns effectively.\n";
+    double train_reduction = (train_loss_history.front() - train_loss_history.back()) / train_loss_history.front() * 100.0;
+    double val_reduction = (val_loss_history.front() - val_loss_history.back()) / val_loss_history.front() * 100.0;
+    
+    std::cout << "\nTrain Loss Reduction: " << train_reduction << "%\n";
+    std::cout << "Val Loss Reduction: " << val_reduction << "%\n";
+    
+    if (val_loss_history.back() < val_loss_history.front()) {
+        std::cout << "SUCCESS: Model is learning and generalizing (Validation Loss reduced by " << val_reduction << "%).\n";
+    } else {
+        std::cout << "WARNING: Model may be overfitting or not learning.\n";
+    }
+    
+    std::cout << "\nRealizando teste de geracao final (apos o treino):\n";
+    std::cout << "------------------------------------\n";
+    std::cout << model.generate(test_prompt, 80) << "\n";
+    std::cout << "------------------------------------\n";
     
     model.pager.print_stats();
     return 0;
