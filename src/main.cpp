@@ -4,6 +4,38 @@
 #include <thread>
 #include <mutex>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+void launch_moe_router(
+    const float* hidden_states,
+    float* router_logits,
+    int* selected_experts,
+    float* gating_probs,
+    int batch_size,
+    int hidden_dim,
+    int num_experts,
+    int top_k,
+    const float* router_weights,
+    const float* router_bias,
+    cudaStream_t stream = 0
+);
+void launch_moe_expert_forward(
+    const float* hidden_states,
+    const int* selected_experts,
+    const float* gating_probs,
+    float* output,
+    int batch_size,
+    int hidden_dim,
+    int expert_hidden_dim,
+    int top_k,
+    const float* expert_w1,
+    const float* expert_w2,
+    const float* expert_b1,
+    const float* expert_b2,
+    cudaStream_t stream = 0
+);
+#endif
+
 struct Expert {
     Tensor w1, w2, b1, b2;
 
@@ -62,6 +94,77 @@ public:
     }
 
     std::vector<float> forward(const std::vector<float>& x, std::vector<int>& active_experts) {
+#ifdef USE_CUDA
+        // CUDA Accelerated Forward
+        float* d_x = nullptr;
+        float* d_router_w = nullptr;
+        float* d_router_b = nullptr;
+        float* d_logits = nullptr;
+        int* d_selected = nullptr;
+        float* d_gates = nullptr;
+        float* d_out = nullptr;
+        
+        cudaMalloc(&d_x, HIDDEN_DIM * sizeof(float));
+        cudaMalloc(&d_router_w, HIDDEN_DIM * NUM_EXPERTS * sizeof(float));
+        cudaMalloc(&d_router_b, NUM_EXPERTS * sizeof(float));
+        cudaMalloc(&d_logits, NUM_EXPERTS * sizeof(float));
+        cudaMalloc(&d_selected, TOP_K * sizeof(int));
+        cudaMalloc(&d_gates, TOP_K * sizeof(float));
+        cudaMalloc(&d_out, HIDDEN_DIM * sizeof(float));
+        
+        cudaMemcpy(d_x, x.data(), HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_router_w, router.weights.data.data(), HIDDEN_DIM * NUM_EXPERTS * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_router_b, router.bias.data.data(), NUM_EXPERTS * sizeof(float), cudaMemcpyHostToDevice);
+        
+        launch_moe_router(d_x, d_logits, d_selected, d_gates, 1, HIDDEN_DIM, NUM_EXPERTS, TOP_K, d_router_w, d_router_b);
+        
+        // Copy back selected indices and gates for backprop tracking on CPU
+        active_experts.resize(TOP_K);
+        std::vector<float> gating_probs(TOP_K);
+        cudaMemcpy(active_experts.data(), d_selected, TOP_K * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(gating_probs.data(), d_gates, TOP_K * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Gather expert weights
+        std::vector<float> expert_w1_flat(NUM_EXPERTS * HIDDEN_DIM * HIDDEN_DIM);
+        std::vector<float> expert_w2_flat(NUM_EXPERTS * HIDDEN_DIM * HIDDEN_DIM);
+        std::vector<float> expert_b1_flat(NUM_EXPERTS * HIDDEN_DIM);
+        std::vector<float> expert_b2_flat(NUM_EXPERTS * HIDDEN_DIM);
+        
+        for (int e = 0; e < NUM_EXPERTS; e++) {
+            std::copy(experts[e].w1.data.begin(), experts[e].w1.data.end(), expert_w1_flat.begin() + e * HIDDEN_DIM * HIDDEN_DIM);
+            std::copy(experts[e].w2.data.begin(), experts[e].w2.data.end(), expert_w2_flat.begin() + e * HIDDEN_DIM * HIDDEN_DIM);
+            std::copy(experts[e].b1.data.begin(), experts[e].b1.data.end(), expert_b1_flat.begin() + e * HIDDEN_DIM);
+            std::copy(experts[e].b2.data.begin(), experts[e].b2.data.end(), expert_b2_flat.begin() + e * HIDDEN_DIM);
+        }
+        
+        float* d_ex_w1 = nullptr; float* d_ex_w2 = nullptr; float* d_ex_b1 = nullptr; float* d_ex_b2 = nullptr;
+        cudaMalloc(&d_ex_w1, expert_w1_flat.size() * sizeof(float));
+        cudaMalloc(&d_ex_w2, expert_w2_flat.size() * sizeof(float));
+        cudaMalloc(&d_ex_b1, expert_b1_flat.size() * sizeof(float));
+        cudaMalloc(&d_ex_b2, expert_b2_flat.size() * sizeof(float));
+        
+        cudaMemcpy(d_ex_w1, expert_w1_flat.data(), expert_w1_flat.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ex_w2, expert_w2_flat.data(), expert_w2_flat.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ex_b1, expert_b1_flat.data(), expert_b1_flat.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ex_b2, expert_b2_flat.data(), expert_b2_flat.size() * sizeof(float), cudaMemcpyHostToDevice);
+        
+        launch_moe_expert_forward(d_x, d_selected, d_gates, d_out, 1, HIDDEN_DIM, HIDDEN_DIM, TOP_K, d_ex_w1, d_ex_w2, d_ex_b1, d_ex_b2);
+        
+        std::vector<float> output(HIDDEN_DIM);
+        cudaMemcpy(output.data(), d_out, HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        cudaFree(d_x); cudaFree(d_router_w); cudaFree(d_router_b); cudaFree(d_logits);
+        cudaFree(d_selected); cudaFree(d_gates); cudaFree(d_out);
+        cudaFree(d_ex_w1); cudaFree(d_ex_w2); cudaFree(d_ex_b1); cudaFree(d_ex_b2);
+        
+        // Sync router state
+        router.prev_scores.assign(NUM_EXPERTS, 0.0f);
+        for(int k=0; k<TOP_K; ++k) {
+            router.prev_scores[active_experts[k]] = gating_probs[k];
+        }
+        
+        return output;
+#else
         auto route_res = router.route(x);
         active_experts = route_res.selected_indices;
         
@@ -73,6 +176,7 @@ public:
             for(int i=0; i<HIDDEN_DIM; ++i) output[i] += gate * expert_out[i];
         }
         return output;
+#endif
     }
     
     void backward(const std::vector<float>& x, const std::vector<float>& grad_out, 
@@ -293,6 +397,13 @@ int main() {
                       << " (PPL = " << std::exp(train_loss) << ")"
                       << " | Val Loss = " << val_loss 
                       << " (PPL = " << std::exp(val_loss) << ")\n";
+        }
+        
+        // Coherence early stopping condition: Loss < 1.9 (PPL < 6.7)
+        if (val_loss < 1.9) {
+            std::cout << "\n[Early Stopping] COHERENCE THRESHOLD ACHIEVED (Val Loss = " 
+                      << val_loss << " < 1.9, PPL = " << std::exp(val_loss) << ")!\n";
+            break;
         }
     }
 

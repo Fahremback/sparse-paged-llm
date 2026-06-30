@@ -64,11 +64,11 @@ public:
         if (ptr) cudaFreeHost(ptr);
     }
 
-    async_copy_h2d(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    void async_copy_h2d(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
     }
 
-    async_copy_d2h(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    void async_copy_d2h(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream));
     }
 
