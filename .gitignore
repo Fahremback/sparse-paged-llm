@@ -7,3 +7,6 @@ CMakeSettings.json
 *.obj
 *.pdb
 *.ilk
+*.bin
+prepare_data.py
+

@@ -184,88 +184,78 @@ public:
     }
 };
 
-std::vector<std::pair<std::vector<int>, int>> generate_dataset() {
-    std::vector<std::pair<std::vector<int>, int>> data;
-    for(int key=10; key<20; ++key) {
-        for(int trial=0; trial<50; ++trial) {
-            std::vector<int> seq;
-            seq.push_back(1); seq.push_back(key & 0xFF);
-            for(int i=0; i<CONTEXT_LEN-2; ++i) seq.push_back(rand() % 5);
-            data.push_back({seq, key & 0xFF});
-        }
-    }
-    return data;
-}
-
-std::vector<std::pair<std::vector<int>, int>> load_real_dataset(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary);
+std::vector<uint8_t> load_binary_dataset(const std::string& filepath) {
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        std::cout << "[Aviso] Nao foi possivel abrir o arquivo do dataset: " << filepath << ". Usando dataset sintetico padrao.\n";
-        return generate_dataset();
+        std::cout << "[Erro] Nao foi possivel abrir o arquivo do dataset: " << filepath << "\n";
+        return std::vector<uint8_t>();
     }
     
-    std::vector<int> tokens;
-    char byte;
-    while (file.get(byte)) {
-        tokens.push_back(static_cast<unsigned char>(byte));
-    }
-    file.close();
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
     
-    std::vector<std::pair<std::vector<int>, int>> data;
-    // Criar sequencias de tamanho CONTEXT_LEN
-    for (size_t i = 0; i + CONTEXT_LEN < tokens.size(); i += CONTEXT_LEN / 2) {
-        std::vector<int> seq(tokens.begin() + i, tokens.begin() + i + CONTEXT_LEN - 1);
-        int target = tokens[i + CONTEXT_LEN - 1];
-        data.push_back({seq, target});
-        if (data.size() >= 1000) break; // Limite de 1000 exemplos para treino rapido
+    std::vector<uint8_t> buffer(size);
+    if (file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        std::cout << "Dataset binario carregado com " << (size / (1024.0 * 1024.0)) << " MB a partir de: " << filepath << "\n";
     }
-    std::cout << "Dataset real carregado com " << data.size() << " sequencias a partir de: " << filepath << "\n";
-    return data;
+    return buffer;
 }
 
 int main() {
-    std::cout << "=== Sparse Paged LLM Experiment ===\n";
+    std::cout << "=== Sparse Paged LLM Experiment (500MB TinyStories) ===\n";
     PaginatedModel model;
     
-    // 1. Carregar dataset e dividir em Treino (85%) e Validacao (15%)
-    auto dataset = load_real_dataset("C:/Users/fahre/Desktop/Qwythos_Project/calibration_mythos_256.txt");
+    // 1. Carregar dataset binario
+    std::vector<uint8_t> dataset = load_binary_dataset("C:/Users/fahre/.gemini/antigravity/scratch/sparse-paged-llm/tinystories.bin");
+    
+    if (dataset.empty()) {
+        std::cout << "Nao foi possivel carregar o dataset binario. Abortando.\n";
+        return 1;
+    }
+    
+    // Dividir em fatias de Treino (90%) e Validacao (10%)
+    size_t train_limit = static_cast<size_t>(dataset.size() * 0.90);
+    size_t val_limit = dataset.size();
+    
+    std::cout << "Limite de Treino: " << (train_limit / (1024.0 * 1024.0)) << " MB\n";
+    std::cout << "Limite de Validacao: " << ((val_limit - train_limit) / (1024.0 * 1024.0)) << " MB\n\n";
     
     std::random_device rd;
     std::mt19937 g(rd());
-    std::shuffle(dataset.begin(), dataset.end(), g);
-    
-    size_t train_size = static_cast<size_t>(dataset.size() * 0.85);
-    std::vector<std::pair<std::vector<int>, int>> train_dataset(dataset.begin(), dataset.begin() + train_size);
-    std::vector<std::pair<std::vector<int>, int>> val_dataset(dataset.begin() + train_size, dataset.end());
-    
-    std::cout << "Divisao dos Dados: " << train_dataset.size() << " treinos, " << val_dataset.size() << " validacoes.\n\n";
     
     std::vector<double> train_loss_history;
     std::vector<double> val_loss_history;
     int epochs = 20;
+    int steps_per_epoch = 1000;
+    int val_steps = 150;
 
     std::cout << "Realizando teste de geracao inicial (antes do treino):\n";
-    std::string test_prompt = "<|im_start|>user\nSolve";
+    std::string test_prompt = "<|im_start|>user\nOnce upon a time, there was a little";
     std::cout << "------------------------------------\n";
-    std::cout << model.generate(test_prompt, 80) << "\n";
+    std::cout << model.generate(test_prompt, 100) << "\n";
     std::cout << "------------------------------------\n\n";
 
     // 2. Loop de Treinamento e Validacao
     for (int ep = 0; ep < epochs; ++ep) {
         double train_loss = 0.0;
-        std::shuffle(train_dataset.begin(), train_dataset.end(), g);
-        for (size_t i = 0; i < train_dataset.size(); ++i) {
-            train_loss += model.forward_step(train_dataset[i].first, train_dataset[i].second, true);
+        for (int step = 0; step < steps_per_epoch; ++step) {
+            size_t idx = std::uniform_int_distribution<size_t>(0, train_limit - CONTEXT_LEN)(g);
+            std::vector<int> seq(dataset.begin() + idx, dataset.begin() + idx + CONTEXT_LEN - 1);
+            int target = dataset[idx + CONTEXT_LEN - 1];
+            train_loss += model.forward_step(seq, target, true);
         }
-        train_loss /= train_dataset.size();
+        train_loss /= steps_per_epoch;
         train_loss_history.push_back(train_loss);
         
         // Avaliacao na Validacao (sem atualizar pesos)
         double val_loss = 0.0;
-        for (size_t i = 0; i < val_dataset.size(); ++i) {
-            val_loss += model.forward_step(val_dataset[i].first, val_dataset[i].second, false);
+        for (int step = 0; step < val_steps; ++step) {
+            size_t idx = std::uniform_int_distribution<size_t>(train_limit, val_limit - CONTEXT_LEN)(g);
+            std::vector<int> seq(dataset.begin() + idx, dataset.begin() + idx + CONTEXT_LEN - 1);
+            int target = dataset[idx + CONTEXT_LEN - 1];
+            val_loss += model.forward_step(seq, target, false);
         }
-        val_loss /= val_dataset.size();
+        val_loss /= val_steps;
         val_loss_history.push_back(val_loss);
 
         if (ep % 5 == 0 || ep == epochs - 1) {
@@ -289,7 +279,7 @@ int main() {
     
     std::cout << "\nRealizando teste de geracao final (apos o treino):\n";
     std::cout << "------------------------------------\n";
-    std::cout << model.generate(test_prompt, 80) << "\n";
+    std::cout << model.generate(test_prompt, 100) << "\n";
     std::cout << "------------------------------------\n";
     
     model.pager.print_stats();
